@@ -1,189 +1,245 @@
+# nsga_parallel.py
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-
-def dominates(ind_a_objs, ind_b_objs):
-    """Verifica se a solução A domina a solução B (problema de minimização)."""
-    return all(a <= b for a, b in zip(ind_a_objs, ind_b_objs)) and any(a < b for a, b in zip(ind_a_objs, ind_b_objs))
-
+from math import inf
+import concurrent.futures
+import time
 import multiprocessing
+from functools import partial
 
-# Supondo que sua função 'dominates' já existe
-# def dominates(ind_a_objs, ind_b_objs): ...
+# ======== Parâmetros (edite se quiser) ========
+N_VALUES = [20, 50, 100, 200]
+IND_SIZE = 30
+GENERATIONS = 100
+RUNS = 10
+OUTDIR = "nsga_results"
+BASE_SEED = 42  # muda isso para outra reprodução diferente
+MAX_WORKERS = None  # None -> usa cpu_count()
 
-def _calculate_dominance_for_one(args):
-    """
-    Função auxiliar que calcula a dominância para um único indivíduo.
-    Projetada para ser usada com multiprocessing.Pool.
-    """
-    pop_idx, population_objs = args
-    pop_size = len(population_objs)
-    
-    dominates_over_p = []
-    gets_dominated_p = 0
-    
-    # Compara o indivíduo 'pop_idx' com todos os outros
-    for compare_idx in range(pop_size):
-        if pop_idx == compare_idx:
-            continue
-            
-        if dominates(population_objs[pop_idx], population_objs[compare_idx]):
-            dominates_over_p.append(compare_idx)
-        elif dominates(population_objs[compare_idx], population_objs[pop_idx]):
-            gets_dominated_p += 1
-            
-    return dominates_over_p, gets_dominated_p
+os.makedirs(OUTDIR, exist_ok=True)
 
-def pareto_fronts(population_objs):
-    """Versão paralelizada da função pareto_fronts."""
-    pop_size = len(population_objs)
-    fronts = [[]]
-    tasks = [(i, population_objs) for i in range(pop_size)]
+# ======== Funções Objetivo (ZDT1) ========
+def f1_ind(ind): return ind[0]
+def g_ind(ind): return 1 + 9 * np.sum(ind[1:]) / (len(ind) - 1)
+def f2_ind(ind): return g_ind(ind) * (1 - np.sqrt(ind[0] / g_ind(ind)))
 
-    with multiprocessing.Pool() as pool:
-        results = pool.map(_calculate_dominance_for_one, tasks)
-    dominates_over, gets_dominated = zip(*results)
-    
-    gets_dominated = list(gets_dominated)
+# ======== Funções Auxiliares ========
+def dominates(a, b):
+    return all(x <= y for x, y in zip(a, b)) and any(x < y for x, y in zip(a, b))
 
-    for i in range(pop_size):
-        if gets_dominated[i] == 0:
-            fronts[0].append(i)
-            
-    i = 0
-    while fronts[i]:
+def pareto_fronts(objs):
+    n = len(objs)
+    dominated_count = [0]*n
+    dominates_list = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j: continue
+            if dominates(objs[i], objs[j]):
+                dominates_list[i].append(j)
+            elif dominates(objs[j], objs[i]):
+                dominated_count[i] += 1
+    fronts = []
+    current = [i for i in range(n) if dominated_count[i] == 0]
+    while current:
+        fronts.append(current)
         next_front = []
-        for pop_idx in fronts[i]:
-            for compare_idx in dominates_over[pop_idx]:
-                gets_dominated[compare_idx] -= 1
-                if gets_dominated[compare_idx] == 0:
-                    next_front.append(compare_idx)
-        i += 1
-        fronts.append(next_front)
-
-    fronts.pop()
+        for p in current:
+            for q in dominates_list[p]:
+                dominated_count[q] -= 1
+                if dominated_count[q] == 0:
+                    next_front.append(q)
+        current = next_front
     return fronts
 
-def crowding_distance(points):
-    """Calcula a distância de aglomeração para um conjunto de pontos na mesma frente."""
-    n_points = len(points)
-    if n_points <= 2:
-        return [float('inf')] * n_points
+def crowding_distance(front, objs):
+    n = len(front)
+    distances = {i: 0.0 for i in front}
+    if n <= 2:
+        for i in front:
+            distances[i] = float('inf')
+        return np.array([distances[i] for i in front])
+    obj_count = len(objs[0])
+    for m in range(obj_count):
+        front_sorted = sorted(front, key=lambda idx: objs[idx][m])
+        vals = [objs[idx][m] for idx in front_sorted]
+        vmin, vmax = vals[0], vals[-1]
+        denom = vmax - vmin if vmax != vmin else 1.0
+        distances[front_sorted[0]] = float('inf')
+        distances[front_sorted[-1]] = float('inf')
+        for k in range(1, n - 1):
+            prev_val = vals[k - 1]
+            next_val = vals[k + 1]
+            distances[front_sorted[k]] += (next_val - prev_val) / denom
+    return np.array([distances[i] for i in front])
 
-    distances = [0.0] * n_points
-    indexed_points = list(enumerate(points))
-    n_obj = len(points[0])
+# ======== Operadores ========
+def generate_pop(ind_size, pop_size):
+    return np.random.rand(pop_size, ind_size)
 
-    for i in range(n_obj):
-        indexed_points.sort(key=lambda x: x[1][i])
-        min_val = indexed_points[0][1][i]
-        max_val = indexed_points[-1][1][i]
+def crossover(p1, p2):
+    alpha = np.random.rand(*p1.shape)
+    return alpha * p1 + (1 - alpha) * p2
 
-        if max_val == min_val:
-            continue
+def mutation(x, rate=0.1, delta=0.1):
+    x = x.copy()
+    for i in range(len(x)):
+        if np.random.rand() < rate:
+            x[i] = np.clip(x[i] + np.random.uniform(-delta, delta), 0, 1)
+    return x
 
-        distances[indexed_points[0][0]] = float('inf')
-        distances[indexed_points[-1][0]] = float('inf')
+# ======== Métricas ========
+def hypervolume(front_objs, ref=(1, 1)):
+    if len(front_objs) == 0:
+        return 0.0
+    pts = sorted(front_objs, key=lambda x: x[0])
+    hv = 0.0
+    prev_f1 = ref[0]
+    for f1_, f2_ in reversed(pts):
+        width = prev_f1 - f1_
+        height = ref[1] - f2_
+        width = max(width, 0)
+        height = max(height, 0)
+        hv += width * height
+        prev_f1 = f1_
+    return hv
 
-        for j in range(1, n_points - 1):
-            distances[indexed_points[j][0]] += (indexed_points[j + 1][1][i] - indexed_points[j - 1][1][i]) / (max_val - min_val)
+def spacing(front_objs):
+    if len(front_objs) <= 1:
+        return 0.0
+    dists = []
+    for i, a in enumerate(front_objs):
+        others = [b for j, b in enumerate(front_objs) if j != i]
+        min_dist = min(np.linalg.norm(np.array(a) - np.array(b)) for b in others)
+        dists.append(min_dist)
+    d_mean = np.mean(dists)
+    return np.sqrt(np.sum((dists - d_mean) ** 2) / (len(dists) - 1))
 
-    return distances
+# ======== NSGA-II (uma execução) ========
+def run_nsga(pop_size, ind_size, generations, ref=(1, 10)):
+    pop = generate_pop(ind_size, pop_size)
+    hv_values, sp_values = [], []
+    for gen in range(generations):
+        objs = [[f1_ind(ind), f2_ind(ind)] for ind in pop]
+        fronts = pareto_fronts(objs)
+        best_front_objs = [objs[i] for i in fronts[0]] if fronts else []
+        hv_values.append(hypervolume(best_front_objs, ref))
+        sp_values.append(spacing(best_front_objs))
+        # Geração de filhos
+        children = [mutation(crossover(pop[np.random.randint(pop_size)], pop[np.random.randint(pop_size)]))
+                    for _ in range(pop_size)]
+        union = np.vstack((pop, np.array(children)))
+        union_objs = [[f1_ind(ind), f2_ind(ind)] for ind in union]
+        union_fronts = pareto_fronts(union_objs)
+        new_pop_idx = []
+        for front in union_fronts:
+            if len(new_pop_idx) + len(front) <= pop_size:
+                new_pop_idx.extend(front)
+            else:
+                remaining = pop_size - len(new_pop_idx)
+                distances = crowding_distance(front, union_objs)
+                order = np.argsort(distances)[::-1]
+                picked = [front[i] for i in order[:remaining]]
+                new_pop_idx.extend(picked)
+                break
+        pop = union[new_pop_idx]
+    final_objs = [[f1_ind(ind), f2_ind(ind)] for ind in pop]
+    final_fronts = pareto_fronts(final_objs)
+    final_best = [final_objs[i] for i in final_fronts[0]] if final_fronts else []
+    return final_best, np.array(hv_values), np.array(sp_values)
 
-def f1(x: np.ndarray) -> float:
-    """Primeira função objetivo do ZDT1."""
-    return x[0]
+# ======== Wrapper para execução em processo separado (recebe tupla de args) ========
+def run_single_task(task):
+    """
+    task: tuple (N, IND_SIZE, GENERATIONS, seed)
+    retorna: (N, hv_array, sp_array)
+    """
+    N, ind_size, generations, seed = task
+    # seed específica por processo/run:
+    np.random.seed(int(seed))
+    # executar NSGA-II
+    _, hv, sp = run_nsga(N, ind_size, generations)
+    return (N, hv, sp)
 
-def g(x: np.ndarray) -> float:
-    """Função auxiliar g do ZDT1."""
-    return 1 + 9 * np.sum(x[1:]) / (len(x) - 1)
+# ======== Função principal: organizar tasks, paralelizar, agregar e plotar ========
+def main(n_values=N_VALUES, ind_size=IND_SIZE, generations=GENERATIONS, runs=RUNS, base_seed=BASE_SEED, outdir=OUTDIR, max_workers=MAX_WORKERS):
+    # construir lista de tasks (cada run é independente)
+    tasks = []
+    idx = 0
+    for N in n_values:
+        for r in range(runs):
+            seed = base_seed + idx
+            tasks.append((N, ind_size, generations, seed))
+            idx += 1
 
-def f2(x: np.ndarray) -> float:
-    """Segunda função objetivo do ZDT1."""
-    g_x = g(x)
-    f1_x = f1(x)
-    return g_x * (1 - np.sqrt(f1_x / g_x))
+    cpu_count = multiprocessing.cpu_count()
+    workers = max_workers if (max_workers is not None) else cpu_count
+    print(f"Executando {len(tasks)} tasks em até {workers} workers (CPU: {cpu_count}) ...")
 
-def generate_pop(individual_size: int, population_size: int) -> np.ndarray:
-    """Gera a população inicial com valores entre 0 e 1."""
-    return np.random.uniform(0, 1, (population_size, individual_size))
+    # dicionário para armazenar hv/sp por N
+    hv_runs_by_N = {N: [] for N in n_values}
+    sp_runs_by_N = {N: [] for N in n_values}
 
-def crossover(parent_1, parent_2):
-    """Crossover aritmético."""
-    alpha = np.random.uniform(0, 1, size=parent_1.shape)
-    return alpha * parent_1 + (1 - alpha) * parent_2
+    start_time = time.time()
+    # Executa em paralelo
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(run_single_task, t): t for t in tasks}
+        completed = 0
+        for fut in concurrent.futures.as_completed(futures):
+            N_res, hv_res, sp_res = fut.result()
+            hv_runs_by_N[N_res].append(hv_res)
+            sp_runs_by_N[N_res].append(sp_res)
+            completed += 1
+            if completed % 5 == 0 or completed == len(tasks):
+                print(f"  {completed}/{len(tasks)} tasks concluídas...")
 
-def mutation(offspring: np.ndarray, mutation_rate=0.1, delta=0.1) -> np.ndarray:
-    """Mutação que adiciona um pequeno valor aleatório."""
-    for i in range(len(offspring)):
-        if np.random.rand() < mutation_rate:
-            offspring[i] += np.random.uniform(-delta, delta)
-            offspring[i] = np.clip(offspring[i], 0, 1) 
-    return offspring
+    total_time = time.time() - start_time
+    print(f"Paralelização finalizada em {total_time:.1f}s")
 
-def plot_generations(generation_obj_values, filename='geracoes.png'):
-    """Plota a última geração, colorindo por frente de Pareto."""
-    final_gen_objs = generation_obj_values[-1]
-    fronts = pareto_fronts(final_gen_objs)
+    results = {}
+    for N in n_values:
+        hv_array = np.array(hv_runs_by_N[N])  # shape (runs, generations)
+        sp_array = np.array(sp_runs_by_N[N])
+        hv_mean = np.mean(hv_array, axis=0)
+        hv_std = np.std(hv_array, axis=0)
+        sp_mean = np.mean(sp_array, axis=0)
+        sp_std = np.std(sp_array, axis=0)
+        results[N] = (hv_mean, hv_std, sp_mean, sp_std)
 
-    plt.figure(figsize=(8, 6))
-    colors = plt.cm.viridis(np.linspace(0, 1, len(fronts)))
-
-    for i, front in enumerate(fronts):
-        f1_vals = [final_gen_objs[idx][0] for idx in front]
-        f2_vals = [final_gen_objs[idx][1] for idx in front]
-        plt.scatter(f1_vals, f2_vals, color=colors[i], label=f'Frente {i+1}')
-    
-    plt.xlabel('f1(x) - Minimizar')
-    plt.ylabel('f2(x) - Minimizar')
-    plt.title('Frentes de Pareto da Última Geração')
+    # ======== Plot convergência média (hipervolume) ========
+    plt.figure(figsize=(10,6))
+    gens = np.arange(generations)
+    for N, (hv_mean, hv_std, _, _) in results.items():
+        plt.plot(gens, hv_mean, label=f'N={N}')
+        plt.fill_between(gens, hv_mean - hv_std, hv_mean + hv_std, alpha=0.2)
+    plt.title("Convergência Média do Hipervolume (paralelizado)")
+    plt.xlabel("Geração")
+    plt.ylabel("Hipervolume Médio ± 1σ")
     plt.legend()
     plt.grid(True)
-    plt.savefig(filename)
-    # plt.show()
+    hv_path = os.path.join(outdir, "hv_convergencia_media_parallel.png")
+    plt.savefig(hv_path, dpi=300)
+    plt.close()
+    print(f"Gráfico hipervolume salvo em: {hv_path}")
 
-def main():
-    POPULATION_SIZE = 1000
-    INDIVIDUAL_SIZE = 100
-    GENERATIONS = 50
+    # ======== Plot convergência média (spacing) ========
+    plt.figure(figsize=(10,6))
+    for N, (_, _, sp_mean, sp_std) in results.items():
+        plt.plot(gens, sp_mean, label=f'N={N}')
+        plt.fill_between(gens, sp_mean - sp_std, sp_mean + sp_std, alpha=0.2)
+    plt.title("Convergência Média do Spacing (paralelizado)")
+    plt.xlabel("Geração")
+    plt.ylabel("Spacing Médio ± 1σ")
+    plt.legend()
+    plt.grid(True)
+    sp_path = os.path.join(outdir, "spacing_convergencia_media_parallel.png")
+    plt.savefig(sp_path, dpi=300)
+    plt.close()
+    print(f"Gráfico spacing salvo em: {sp_path}")
 
-    population = generate_pop(INDIVIDUAL_SIZE, POPULATION_SIZE)
-    generation_obj_values = []
+    print(f"✅ Todos os resultados salvos em: {outdir}")
+    return results
 
-    for i in range(GENERATIONS):
-        print(f'Geração {i+1}/{GENERATIONS}')
-        
-        current_pop_objs = [ [f1(ind), f2(ind)] for ind in population ]
-        generation_obj_values.append(current_pop_objs)
-
-        children_pop = []
-        for _ in range(POPULATION_SIZE):
-            p1_idx, p2_idx = np.random.choice(range(POPULATION_SIZE), 2, replace=False)
-            offspring = crossover(population[p1_idx], population[p2_idx])
-            offspring = mutation(offspring)
-            children_pop.append(offspring)
-        
-        combined_pop = np.vstack((population, np.array(children_pop)))
-        
-        combined_pop_objs = [ [f1(ind), f2(ind)] for ind in combined_pop ]
-        
-        fronts_idx = pareto_fronts(combined_pop_objs)
-
-        new_population_indices = []
-        for front in fronts_idx:
-            if len(new_population_indices) + len(front) <= POPULATION_SIZE:
-                new_population_indices.extend(front)
-            else:
-                population_diff = POPULATION_SIZE - len(new_population_indices)
-                
-                chosen_indices = np.random.choice(front, size=population_diff, replace=False)
-                
-                new_population_indices.extend(chosen_indices.tolist())
-                break
-        
-        population = combined_pop[new_population_indices]
-
-    plot_generations(generation_obj_values)
-
-if __name__ == '__main__':
-    main()
+# ======== Execução protegida (necessário para multiprocessing em Windows) ========
+if __name__ == "__main__":
+    results = main()
